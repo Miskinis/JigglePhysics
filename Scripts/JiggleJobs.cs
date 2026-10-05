@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using Unity.Collections;
 using Unity.Collections.LowLevel.Unsafe;
 using Unity.Jobs;
+using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Jobs;
 
@@ -171,6 +172,9 @@ public class JiggleJobs {
         if (_memoryBus.transformCount == 0) {
             _memoryBus.CommitTrees();
             _memoryBus.CommitColliders();
+            // FORK PATCH (P4): no trees — clear any queued impulses so they cannot fire stale
+            // later against a character that starts simulating after this point.
+            _memoryBus.ApplyPendingRotationImpulses();
             jobSimulate.UpdateArrays(_memoryBus);
             jobBulkTransformRead.UpdateArrays(_memoryBus);
             jobBulkReadRoots.UpdateArrays(_memoryBus);
@@ -201,6 +205,11 @@ public class JiggleJobs {
         
         _memoryBus.CommitTrees();
         _memoryBus.CommitColliders();
+
+        // FORK PATCH (P4): the previous simulate job is complete and tree add/remove commands are
+        // committed, so queued rotational inertia impulses can be stamped onto point state on the
+        // main thread — deterministic, and without racing the job about to be scheduled below.
+        _memoryBus.ApplyPendingRotationImpulses();
 
         jobSimulate.UpdateArrays(_memoryBus);
         jobSimulate.timeIncrements = timeIncrements;
@@ -255,6 +264,14 @@ public class JiggleJobs {
 
     public void ScheduleRemove(JiggleTree tree) {
         _memoryBus.ScheduleRemove(tree);
+    }
+
+    /// <summary>
+    /// FORK PATCH (P4): forwards a queued rotational inertia impulse to the memory bus. Consumed by
+    /// the next <see cref="Simulate"/>.
+    /// </summary>
+    public void QueueRotationImpulse(int rootID, float3 worldPivot, float yawAngleRadians) {
+        _memoryBus.QueueRotationImpulse(rootID, worldPivot, yawAngleRadians);
     }
     
     public void ScheduleAdd(JiggleColliderSerializable collider) {

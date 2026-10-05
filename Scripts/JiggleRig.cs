@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Serialization;
 
@@ -85,6 +86,20 @@ public class JiggleRig : MonoBehaviour, IJiggleParameterProvider {
 
     public void SnapToRestPose() {
         jiggleRigData.SnapToRestPose();
+    }
+
+    /// <summary>
+    /// FORK PATCH (P4): queues a one-tick rotational inertia impulse for this rig's simulated
+    /// chain (see <see cref="JigglePhysics.QueueRotationImpulse"/>). No-op when the rig is
+    /// disabled or has no root bone — an unregistered rig has no tree to push.
+    /// </summary>
+    /// <param name="worldPivot">World-space point the vertical rotation axis passes through.</param>
+    /// <param name="yawAngleRadians">Rotation applied to the chain for one tick (Unity Y sign).</param>
+    public void QueueRotationImpulse(Vector3 worldPivot, float yawAngleRadians) {
+        if (!enabled || !jiggleRigData.rootBone) {
+            return;
+        }
+        JigglePhysics.QueueRotationImpulse(jiggleRigData.rootBone, (float3)worldPivot, yawAngleRadians);
     }
 
     /// <summary>

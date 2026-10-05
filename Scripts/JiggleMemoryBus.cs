@@ -106,6 +106,21 @@ public class JiggleMemoryBus {
     private List<JiggleColliderSerializable> pendingSceneColliderAdd;
     private List<JiggleColliderSerializable> pendingSceneColliderRemove;
 
+    // FORK PATCH (P4): one-shot rotational inertia impulses queued from the main thread (UI/gameplay
+    // code) and consumed by JiggleJobs.Simulate right after the previous simulate job completes.
+    // Queueing instead of mutating point data directly means callers never race the scheduled job
+    // and never force an extra job completion/sync point.
+    private struct RotationImpulse {
+        public int rootID;
+        public float3 pivot;
+        public float yawAngleRadians;
+    }
+    private readonly List<RotationImpulse> pendingRotationImpulses = new();
+
+    // Largest yaw angle (radians) a single queued impulse may carry. A mouse/UI event can report a
+    // large movement spike; clamping keeps one event from folding a chain over itself.
+    public const float MaxRotationImpulseAngle = 0.25f;
+
     private bool hasWrittenData = false;
 
     private int preTransformCount;
@@ -950,6 +965,66 @@ public void GetResults(out JiggleTransform[] poses, out JiggleTreeJobData[] tree
             commandType = AddRemoveCommand.CommandType.Remove,
             tree = jiggleTree,
         });
+    }
+
+    /// <summary>
+    /// FORK PATCH (P4): queue a one-tick rotational inertia impulse for the tree whose root
+    /// transform ID is <paramref name="rootID"/>. Applied on the main thread by
+    /// <see cref="ApplyPendingRotationImpulses"/> — never touches point memory while the simulate
+    /// job may still be running.
+    /// </summary>
+    public void QueueRotationImpulse(int rootID, float3 worldPivot, float yawAngleRadians) {
+        if (yawAngleRadians == 0f) {
+            return;
+        }
+        pendingRotationImpulses.Add(new RotationImpulse {
+            rootID = rootID,
+            pivot = worldPivot,
+            yawAngleRadians = math.clamp(yawAngleRadians, -MaxRotationImpulseAngle, MaxRotationImpulseAngle),
+        });
+    }
+
+    /// <summary>
+    /// FORK PATCH (P4): applies every queued rotation impulse and clears the queue. Main-thread
+    /// only. Must run after the previous simulate job has completed (and after tree add/remove
+    /// commands are committed) so each tree's points are stable and newly added trees receive the
+    /// impulse on their first tick. Matching trees that are not registered (yet) are skipped and
+    /// the impulse is dropped — callers queue per event, not as persistent state.
+    /// </summary>
+    public void ApplyPendingRotationImpulses() {
+        int impulseCount = pendingRotationImpulses.Count;
+        if (impulseCount == 0) {
+            return;
+        }
+
+        for (int c = 0; c < impulseCount; c++) {
+            RotationImpulse impulse = pendingRotationImpulses[c];
+            for (int t = 0; t < treeCount; t++) {
+                JiggleTreeJobData tree = jiggleTreeStructsArray[t];
+                if (tree.rootID != impulse.rootID) {
+                    continue;
+                }
+
+                unsafe {
+                    if (tree.points == null) {
+                        continue;
+                    }
+                    float maxDistanceFromRoot = 0f;
+                    for (int i = 0; i < tree.pointCount; i++) {
+                        JiggleSimulatedPoint point = tree.points[i];
+                        if (point.hasTransform && point.distanceFromRoot > maxDistanceFromRoot) {
+                            maxDistanceFromRoot = point.distanceFromRoot;
+                        }
+                    }
+                    for (int i = 0; i < tree.pointCount; i++) {
+                        JiggleSimulatedPoint.ApplyRotationImpulse(ref tree.points[i], maxDistanceFromRoot,
+                            impulse.pivot, impulse.yawAngleRadians);
+                    }
+                }
+            }
+        }
+
+        pendingRotationImpulses.Clear();
     }
 
     public void Dispose() {

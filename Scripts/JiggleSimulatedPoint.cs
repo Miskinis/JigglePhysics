@@ -87,6 +87,35 @@ public unsafe struct JiggleSimulatedPoint {
         return true;
     }
 
+    /// <summary>
+    /// FORK PATCH (P4): adds an inertial velocity kick to a simulated point for one tick, as if the
+    /// character under it had just rotated by <paramref name="yawAngleRadians"/> about the vertical
+    /// axis through <paramref name="worldPivot"/>. The kick is ramped from 0 at the chain root to 1
+    /// at the deepest point (<paramref name="maxDistanceFromRoot"/>) so the chain BENDS instead of
+    /// translating rigidly. Only <c>position</c> is stamped: <c>lastPosition</c> keeps the previous
+    /// value, and Verlet reads the difference as velocity. The normal angle/length/drag response
+    /// then pulls the chain back and settles it. Only points backed by a transform are kicked —
+    /// virtual points are derived from their neighbours.
+    /// Depends only on the point's own fields and the arguments (no jobs, no time), so it is
+    /// directly unit-testable.
+    /// </summary>
+    public static void ApplyRotationImpulse(ref JiggleSimulatedPoint point, float maxDistanceFromRoot,
+        float3 worldPivot, float yawAngleRadians) {
+        if (!point.hasTransform || yawAngleRadians == 0f) {
+            return;
+        }
+        float weight = maxDistanceFromRoot > 0f
+            ? math.clamp(point.distanceFromRoot / maxDistanceFromRoot, 0f, 1f)
+            : 1f;
+        if (weight <= 0f) {
+            return;
+        }
+        // Positive Unity Y rotation maps (x, z) -> (x*cos + z*sin, -x*sin + z*cos); small-angle
+        // linearization gives the tangential velocity kick below.
+        float3 radius = point.position - worldPivot;
+        point.position += new float3(yawAngleRadians * radius.z, 0f, -yawAngleRadians * radius.x) * weight;
+    }
+
     public override string ToString() {
         return $"(position: {position},\nlastPosition: {lastPosition},\n" +
                $"workingPosition: {workingPosition},\n" +

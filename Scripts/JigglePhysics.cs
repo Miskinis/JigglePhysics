@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Unity.Mathematics;
 using UnityEngine;
 using UnityEngine.Profiling;
 
@@ -113,6 +114,36 @@ public static class JigglePhysics {
     }
     
     public static void SetGlobalDirty() => _globalDirty = true;
+
+    /// <summary>
+    /// FORK PATCH (P4): queues a one-tick rotational inertia impulse for the jiggle tree rooted at
+    /// <paramref name="rootBone"/>. The simulated chain receives a tangential velocity kick about
+    /// the vertical axis through <paramref name="worldPivot"/>, ramped by distance from the chain
+    /// root, so the chain lags/bends as if the character had just rotated by
+    /// <paramref name="yawAngleRadians"/>; the normal constraints and drag then settle it. Applied
+    /// on the next simulation tick —
+    /// callers can fire from UI/gameplay code without scheduling or completing jobs themselves and
+    /// without mutating transforms.
+    /// <para>
+    /// Matches trees by root transform ID: if the rig is not registered (disabled, rebind pending)
+    /// the impulse is dropped, so a single call per event is safe. Angle sign follows Unity's Y
+    /// rotation (positive = clockwise seen from above).
+    /// </para>
+    /// </summary>
+    /// <param name="rootBone">Registered rig root — must be the same transform the tree was built from.</param>
+    /// <param name="worldPivot">World-space point the vertical rotation axis passes through (e.g. the camera look-at pivot).</param>
+    /// <param name="yawAngleRadians">Rotation applied to the chain for one tick; clamped to ±<see cref="JiggleMemoryBus.MaxRotationImpulseAngle"/> per call.</param>
+    public static void QueueRotationImpulse(Transform rootBone, float3 worldPivot, float yawAngleRadians) {
+        if (jobs == null || !rootBone || yawAngleRadians == 0f) {
+            return;
+        }
+#if UNITY_6000_4_OR_NEWER
+        int rootID = rootBone.GetEntityId();
+#else
+        int rootID = rootBone.GetInstanceID();
+#endif
+        jobs.QueueRotationImpulse(rootID, worldPivot, yawAngleRadians);
+    }
 
     public static void AddJiggleCollider(JiggleColliderSerializable collider) {
         jobs.ScheduleAdd(collider);

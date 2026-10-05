@@ -379,6 +379,9 @@ public struct JiggleJobSimulate : IJobFor {
         return false;
     }
     private unsafe void Constrain(JiggleTreeJobData tree) {
+        // FORK PATCH (P5): one-bone chains (a single transform-backed point) must NOT use the
+        // special root solve below — see the region comment there.
+        bool singleTransformPoint = HasSingleTransformPoint(tree);
         for (int i = 0; i < tree.pointCount; i++) {
             var point = tree.points+i;
             var pointParameters = tree.parameters + i;
@@ -422,7 +425,14 @@ public struct JiggleJobSimulate : IJobFor {
             
             #region Special root particle solve
 
-            if (parent->parentIndex == -1) {
+            // FORK PATCH (P5): the special root solve hard-lerps the chain ROOT to its animated pose
+            // (rootElasticity defaults to 1, so rootElasticity² = 1 every tick). That is right for a
+            // multi-bone chain — the root is the animation-driven attachment and its children carry
+            // the jiggle. A one-bone chain's sole point is BOTH root and tip: snapping it made the
+            // rig inert (drag impulses, gravity and animation all discarded). Let that point take
+            // the regular chain constraints below instead, so it hangs/tracks on the rig's own
+            // stiffness/drag like any other soft tip.
+            if (!singleTransformPoint && parent->parentIndex == -1) {
                 var child = tree.points[point->childrenIndices[0]];
                 point->workingPosition = point->workingPosition = math.lerp(point->workingPosition, point->pose,
                     pointParameters->rootElasticity * pointParameters->rootElasticity);
@@ -582,6 +592,16 @@ public struct JiggleJobSimulate : IJobFor {
         var rootPose = rootPoint.pose;
         var rootParameters = tree.parameters[1];
         var rootParameterElasticity = 1f-(1f-rootParameters.rootElasticity) * rootParameters.airDrag;
+
+        // FORK PATCH (P5): a tree with a single transform-backed point (a one-bone chain) has no
+        // animation-driven segment above it — the sole bone IS the soft part. Root snapping exists
+        // to keep a chain ROOT attached to the animated skeleton while its children simulate; with
+        // it enabled here, JiggleJobInterpolation writes the animated root transform back over the
+        // simulation, so the rig is visibly inert (drag impulses, gravity and animation all
+        // discarded). Let the single point's simulated pose through unchanged.
+        if (HasSingleTransformPoint(tree)) {
+            rootParameterElasticity = 0f;
+        }
         
         for (int i = 0; i < tree.pointCount; i++) {
             var point = tree.points+i;
@@ -633,6 +653,25 @@ public struct JiggleJobSimulate : IJobFor {
             };
             tree.WriteOutputPose(outputPoses, i, transform, rootSimulationPosition - rootPose, rootSimulationPosition, rootParameterElasticity);
         }
+    }
+
+    /// <summary>
+    /// FORK PATCH (P5): true when the tree is simulated through exactly one transform-backed point
+    /// (a one-bone chain). Virtual roots/tips do not count. Such a tree has no other bone to carry
+    /// the simulated motion, so <see cref="ApplyPose"/> must not root-snap it.
+    /// </summary>
+    private unsafe bool HasSingleTransformPoint(JiggleTreeJobData tree) {
+        int transformPointCount = 0;
+        for (int i = 0; i < tree.pointCount; i++) {
+            if (!tree.points[i].hasTransform) {
+                continue;
+            }
+            transformPointCount++;
+            if (transformPointCount > 1) {
+                return false;
+            }
+        }
+        return transformPointCount == 1;
     }
 
     // FORK PATCH (P3b): previously threw on the first invalid frame, freezing the whole

@@ -278,6 +278,126 @@ rejects a null root — public callers included.)
 
 ---
 
+## P4 — Rotational inertia impulse API (jiggle reaction to editor camera drag)
+
+**Files:**
+- `Scripts/JiggleSimulatedPoint.cs` — `ApplyRotationImpulse(...)`
+- `Scripts/JiggleMemoryBus.cs` — `QueueRotationImpulse(...)`, `ApplyPendingRotationImpulses()`,
+  `MaxRotationImpulseAngle`
+- `Scripts/JiggleJobs.cs` — `QueueRotationImpulse(...)` forwarder + consume hook in `Simulate`
+- `Scripts/JigglePhysics.cs` — `QueueRotationImpulse(Transform, float3, float)`
+- `Scripts/JiggleRig.cs` — `QueueRotationImpulse(Vector3, float)`
+
+**Problem.** Consumers had no way to push motion into a simulated chain from gameplay/UI code
+without moving the animated transforms. The Character Editor orbits the camera on viewport drag
+(R14.1) — the character never moves, so world-space Verlet chains see no motion and never react,
+while `R10.4` ("show jiggle effects when the player rotates the character") expects a reaction.
+Moving the character root instead is not an option: it cancels against the camera orbit and fights
+`SetPivotForSection` bone-space pivots.
+
+**Design.** Main-thread impulse queue consumed at the next simulation tick:
+
+1. **Queue (safe from UI/gameplay code).** `JigglePhysics`/`JiggleRig` append
+   `{ rootID, worldPivot, yawAngleRadians }` to the memory bus. `rootID` is the root transform's
+   `GetInstanceID()`/`GetEntityId()` — exactly what `JiggleTree.rootID` stores. The per-call angle
+   is clamped to ±`MaxRotationImpulseAngle` (0.25 rad) so a mouse-event spike cannot fold a chain.
+2. **Consume (main thread, race-free).** `JiggleJobs.Simulate` applies the queue right after the
+   previous simulate job is completed (`handleSimulate.Complete()`) and after tree add/remove
+   commands are committed. No extra job completion or sync point is introduced — the complete
+   already happens once per tick — and point memory is never touched while the job is running.
+3. **Apply.** For each tree whose `rootID` matches: compute `maxDistanceFromRoot` across
+   `hasTransform` points, then per point add a one-tick inertial velocity kick along the tangential
+   direction about the world-space vertical axis through the pivot, ramped by
+   `distanceFromRoot / maxDistanceFromRoot`. Only `position` is stamped — `lastPosition` keeps the
+   previous value, so Verlet reads the difference as extra velocity; the chain lags/bends behind
+   the (apparent) rotation, and the existing angle/length constraints plus drag settle it. Only
+   transform-backed points are kicked — virtual points follow from them. Unmatched impulses are
+   dropped (rig not registered), so one call per event is always safe. Live-measured on the
+   character-editor preview rigs (breast chain, 0.4 m camera pivot): a sustained 3°/frame drag
+   holds the tip ~7 mm off rest at gain 1, settling to zero in ~10 ticks; the editor applies a
+   gain of 3 with a ±0.12 rad per-event clamp.
+
+**New API surface (additive, upstream-compatible):**
+
+```csharp
+// JigglePhysics
+public static void QueueRotationImpulse(Transform rootBone, float3 worldPivot, float yawAngleRadians);
+
+// JiggleRig
+public void QueueRotationImpulse(Vector3 worldPivot, float yawAngleRadians);
+
+// JiggleMemoryBus
+public void QueueRotationImpulse(int rootID, float3 worldPivot, float yawAngleRadians);
+public void ApplyPendingRotationImpulses();
+public const float MaxRotationImpulseAngle = 0.25f;
+
+// JiggleSimulatedPoint
+public static void ApplyRotationImpulse(ref JiggleSimulatedPoint point, float maxDistanceFromRoot,
+    float3 worldPivot, float yawAngleRadians);
+```
+
+**Character Editor wiring.** `CharacterEditorScreen.OnViewportPointerMove` queues
+`rig.QueueRotationImpulse(_orbitState.pivot, yawDeltaRadians * gain)` for the preview character's
+rigs (rig array cached on pointer-down, so drag updates allocate nothing). The sign is the camera
+yaw delta itself: the character appears to rotate opposite the camera orbit, so the chains are
+kicked in the camera-orbit direction — i.e. they trail the apparent rotation, matching real
+inertia. Pitch drag and zoom do not inject (no apparent vertical-axis rotation).
+
+**Determinism / testing.** `JiggleSimulatedPoint.ApplyRotationImpulse` is a pure ref-struct
+function (no jobs, no Time), unit-testable directly; the queue→consume path is deterministic for a
+given input sequence. Render/visual quality is verified live (drag in the editor viewport).
+
+---
+
+## P5 — One-bone chains were pinned to the animated pose (single-bone rigs were inert)
+
+**File:** `Scripts/JiggleJobSimulate.cs` — `Constrain(...)` special-root-solve skip,
+`ApplyPose(...)` root-snap override, `HasSingleTransformPoint(...)` helper.
+
+**Problem.** A rig whose cached chain has a single bone (the character editor preview's
+`ass.l`/`ass.r` rigs, chain length 1) builds a tree with exactly one transform-backed point, which
+is BOTH the chain root and its tip. Two root-only code paths then discarded the entire simulation
+every tick:
+
+1. `Constrain`'s special root particle solve hard-lerps the chain root to its animated pose
+   (`rootElasticity` defaults to 1, so `lerp(workingPosition, pose, rootElasticity²)` = `pose`).
+   That is correct for a multi-bone root (the animation-driven attachment), but the sole point of
+   a one-bone chain was snapped back to the animated pose before any motion could survive.
+2. `ApplyPose` passed root snap strength 1 to the output pose, and
+   `JiggleJobInterpolation.Execute` applies `pose.position += (snapToReal + rootOffset) *
+   rootSnapStrength` — writing the animated root transform back over the simulated position.
+
+Result: `breast.l`/`breast.r` (2-bone chains) visibly jiggled under the P4 drag impulse while
+`ass.l`/`ass.r` never moved ("breasts jiggle, nothing else"). Instrumented trace: the P4 impulse
+matched all four trees and moved the ass point 36 mm, but its `workingPosition` was back at rest
+within the tick (gate 1) and the output pose was then root-snapped (gate 2).
+
+**Fix.**
+
+- `Constrain`: skip the special root solve for trees with exactly one transform-backed point. The
+  point takes the regular chain constraints (angle/length against the virtual back-projected root),
+  i.e. it behaves like a soft tip driven by the rig's own stiffness/drag instead of a rigid anchor.
+- `ApplyPose`: for the same trees, pass root snap strength 0 so the simulated pose is written
+  instead of being overwritten by the animated root transform.
+- `HasSingleTransformPoint(tree)` counts transform-backed points (virtual roots/tips excluded).
+  Multi-bone chains are completely untouched.
+
+**Live evidence** (real sim jobs driven in Edit mode on the preview prefab; per rig, 5 × 0.12 rad
+impulses about a 0.4 m camera pivot, then release):
+
+| rig | chain | before P5 | after P5 |
+| --- | --- | --- | --- |
+| `breast.l` | 2 | tip 13.40 mm | tip 13.40 mm |
+| `breast.r` | 2 | tip 13.91 mm | tip 13.91 mm |
+| `ass.l` | 1 | **0.00 mm (inert)** | **20.67 mm**, settles to 0.0000 mm |
+| `ass.r` | 1 | **0.00 mm (inert)** | **20.67 mm**, settles to 0.0000 mm |
+
+Simultaneous 45-frame drag at the editor's per-event clamp (0.12 rad every tick, all four rigs):
+peaks breast 19.4/20.3 mm, ass 30.0/30.0 mm; all four settle to ~0. The `Body` SkinnedMeshRenderer
+is skinned to `ass.l`/`ass.r`, so the bone motion is visible.
+
+---
+
 ## Non-code change
 
 - `Packages/com.oddlock.rigging/package.json` — dependency bumped `15.0.0` → **`16.0.1`** to match
