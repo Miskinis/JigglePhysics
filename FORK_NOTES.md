@@ -9,6 +9,7 @@ Modification is permitted and the license is retained.
 | Upstream | `com.gator-dragon-games.jigglephysics` (OpenUPM: https://package.openupm.com) |
 | Upstream author | naelstrof (Gator Dragon Games) |
 | Forked version | **16.0.1** (embedded copy is byte-identical to the upstream release apart from the patches below) |
+| Fork repo | https://github.com/Miskinis/JigglePhysics — branch `oddlock-fork`, tag `v16.0.1-oddlock.1` |
 | License | MIT — `LICENSE` retained, `Copyright (c) naelstrof` |
 | Embedded at | `Packages/com.gator-dragon-games.jigglephysics/` |
 | Consumers | `com.oddlock.rigging`, `com.oddlock.character-editor`, `com.oddlock.appearance` (reference by package name) |
@@ -16,10 +17,21 @@ Modification is permitted and the license is retained.
 **Never edit `Library/PackageCache/`.** This embedded folder is the single source of truth for the
 fork. If the package is ever re-imported from the registry, this folder must not be overwritten.
 
+## Consuming this fork
+
+The `oddlock-fork` branch is the package root (`upm` layout — `package.json` at the repository
+root), so it can be added directly as a UPM git dependency (no `?path=` needed):
+
+```
+https://github.com/Miskinis/JigglePhysics.git#v16.0.1-oddlock.1
+```
+
+Use the pinned tag for reproducibility, or `#oddlock-fork` to track the latest fork state.
+
 ## Re-apply after upstream updates
 
 When updating the upstream version, re-apply the patches below. Every patch site is marked in the
-source with a `FORK PATCH (P1|P2|P3a|P3b)` comment so they can be found with:
+source with a `FORK PATCH (P1|P2|P3a|P3b|P3c|P4|P5)` comment so they can be found with:
 
 ```bash
 grep -rn "FORK PATCH" Packages/com.gator-dragon-games.jigglephysics/Scripts/
