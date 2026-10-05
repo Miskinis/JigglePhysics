@@ -16,6 +16,9 @@ public static class JigglePhysics {
     private static readonly List<JiggleCollider> tempColliders = new ();
     private static readonly List<Transform> tempColliderTransforms = new ();
     private static List<JiggleTreeSegment> rootJiggleTreeSegments;
+    // FORK PATCH (P3a): scratch list for dead child-segment pruning (never modified while the
+    // lookup dictionary is being enumerated).
+    private static readonly List<JiggleTreeSegment> deadSegments = new ();
     private static bool initializedRendering = false;
     private static int skips = 0;
 
@@ -139,14 +142,23 @@ public static class JigglePhysics {
         jobs.FreeOnComplete(pointer);
     }
     
-    public static void AddJiggleTreeSegment(JiggleTreeSegment jiggleTreeSegment) {
+    /// <summary>
+    /// Registers a rig segment. Returns false when another segment already targets the same root
+    /// transform (rejected — the caller must not assume registration succeeded) or the segment
+    /// carries no root.
+    /// </summary>
+    public static bool AddJiggleTreeSegment(JiggleTreeSegment jiggleTreeSegment) {
+        if (jiggleTreeSegment.transform == null) {
+            return false;
+        }
         if (!jiggleRootLookup.TryAdd(jiggleTreeSegment.transform, jiggleTreeSegment)) {
             Debug.LogError("Multiple Jiggle trees detected targeting the same root transform, Jiggle Physics doesn't support this.", jiggleTreeSegment.transform);
-            return;
+            return false;
         }
         RemoveAddChildren(jiggleTreeSegment.transform);
         TryAddRootJiggleTreeSegment(jiggleTreeSegment);
         _globalDirty = true;
+        return true;
     }
     
     private static bool GetParentJiggleTreeSegment(Transform t, out JiggleTreeSegment parentJiggleTreeSegment) {
@@ -192,6 +204,21 @@ public static class JigglePhysics {
             RemoveAddChildren(child);
         }
     }
+
+    /// <summary>
+    /// FORK PATCH (P3a): re-parents every segment whose parent is <paramref name="removedSegment"/>
+    /// to the removed segment's parent. Shared by RemoveJiggleTreeSegment and the dead-transform
+    /// pruning pass so both paths cannot drift.
+    /// </summary>
+    private static void ReparentOrphanedChildren(JiggleTreeSegment removedSegment) {
+        foreach (var kvp in jiggleRootLookup) {
+            if (kvp.Value.parent != removedSegment) continue;
+            kvp.Value.SetParent(removedSegment.parent);
+            if (kvp.Value.parent == null && !rootJiggleTreeSegments.Contains(kvp.Value)) {
+                rootJiggleTreeSegments.Add(kvp.Value);
+            }
+        }
+    }
     
     private static JiggleJobs GetJiggleJobs(double fixedTime, float fixedDeltaTime) {
         if (!_globalDirty) {
@@ -206,9 +233,10 @@ public static class JigglePhysics {
 
     private static void GetJiggleTrees() {
         Profiler.BeginSample("JiggleRoot.GetJiggleTrees");
-        // Prune any segments whose root Transform has been destroyed out-of-band
-        // (e.g. asset bundle unload, scene teardown, or a rig whose OnDisable was
-        // skipped) before attempting to regenerate their trees.
+        // Prune any segment whose root Transform has been destroyed out-of-band (e.g. asset bundle
+        // unload, scene teardown, or a rig whose OnDisable was skipped) before regenerating trees.
+        // FORK PATCH (P3a): this pass also covers CHILD segments; previously only root segments
+        // were pruned, so a dead chain nested under a live root stayed registered forever.
         for (int i = rootJiggleTreeSegments.Count - 1; i >= 0; i--) {
             var seg = rootJiggleTreeSegments[i];
             if (seg.transform == null || seg.jiggleRigData.rootBone == null) {
@@ -223,6 +251,33 @@ public static class JigglePhysics {
             }
             seg.RegenerateJiggleTreeIfNeeded();
             jobs.ScheduleAdd(seg.jiggleTree);
+        }
+
+        // Child segments only receive RegenerateJiggleTreeIfNeeded through their nearest dirty
+        // ancestor segment (parents dirty their tree, which regenerates the chain), but a dead
+        // child must never be left in the lookup. Their registered trees are owned/removed by
+        // the segment lifecycle, so prune the bookkeeping entries here.
+        var pruneDone = false;
+        foreach (var kvp in jiggleRootLookup) {
+            if (kvp.Value.transform == null || kvp.Value.jiggleRigData.rootBone == null) {
+                deadSegments.Add(kvp.Value);
+                pruneDone = true;
+            }
+        }
+        if (pruneDone) {
+            foreach (var dead in deadSegments) {
+                if (dead.transform != null) {
+                    jiggleRootLookup.Remove(dead.transform);
+                }
+                var parent = dead.parent;
+                ReparentOrphanedChildren(dead);
+                if (parent != null) {
+                    parent.SetDirty();
+                    dead.SetParent(null);
+                }
+            }
+            deadSegments.Clear();
+            SetGlobalDirty();
         }
         Profiler.EndSample();
     }
@@ -429,16 +484,17 @@ public static class JigglePhysics {
             rootJiggleTreeSegments.Remove(jiggleTreeSegment);
         }
 
-        jiggleRootLookup.Remove(jiggleTreeSegment.transform);
-
-        // Re-parent orphaned children to the removed segment's parent
-        foreach (var kvp in jiggleRootLookup) {
-            if (kvp.Value.parent != jiggleTreeSegment) continue;
-            kvp.Value.SetParent(jiggleTreeSegment.parent);
-            if (kvp.Value.parent == null && !rootJiggleTreeSegments.Contains(kvp.Value)) {
-                rootJiggleTreeSegments.Add(kvp.Value);
-            }
+        // FORK PATCH (P3): only drop the lookup entry when it actually belongs to this segment.
+        // A segment that was REJECTED by AddJiggleTreeSegment (duplicate root) must never evict
+        // the valid registration that won the duplicate race.
+        var key = jiggleTreeSegment.transform;
+        if (key != null && jiggleRootLookup.TryGetValue(key, out var current) && current == jiggleTreeSegment) {
+            jiggleRootLookup.Remove(key);
         }
+
+        // Re-parent orphaned children to the removed segment's parent (shared with the P3a
+        // dead-transform pruning pass).
+        ReparentOrphanedChildren(jiggleTreeSegment);
 
         jiggleTreeSegment.SetDirty();
 

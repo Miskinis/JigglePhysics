@@ -32,6 +32,19 @@ public class JiggleTreeSegment {
         JigglePhysics.SetGlobalDirty();
     }
 
+    /// <summary>
+    /// FORK PATCH (P2): re-points the segment's registration key at a new root transform after
+    /// a rig rebind. Caller must ensure the segment is currently unregistered (rig disabled) or
+    /// re-register through JigglePhysics.AddJiggleTreeSegment afterwards, then dirty the segment.
+    /// </summary>
+    public void SetRootTransform(Transform newRoot) {
+        if (transform == newRoot) {
+            return;
+        }
+        transform = newRoot;
+        JigglePhysics.SetGlobalDirty();
+    }
+
     private void OnDirty(JiggleTree obj) {
         SetDirty();
     }

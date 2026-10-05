@@ -236,6 +236,140 @@ public struct JiggleRigData {
     }
 
     /// <summary>
+    /// The rig root's current name: the serialized chain root (index 0 is always the root) when
+    /// present, otherwise the live <see cref="rootBone"/>. Null when neither exists.
+    /// </summary>
+    public string GetCachedRootName() {
+        var cached = transformCachedData;
+        if (cached is { Length: > 0 } && cached[0].bone != null) {
+            return cached[0].bone.name;
+        }
+        return rootBone != null ? rootBone.name : null;
+    }
+
+    /// <summary>
+    /// True when <paramref name="candidate"/> may serve as this rig's new root: its name equals
+    /// the rig's current root name. When the rig has no cached chain and no existing root there is
+    /// nothing to compare, so any non-null candidate is accepted (fresh/uninitialized rig).
+    /// </summary>
+    private bool IsValidNewRoot(Transform candidate) {
+        var expectedName = GetCachedRootName();
+        if (string.IsNullOrEmpty(expectedName)) {
+            return true;
+        }
+        return candidate.name == expectedName;
+    }
+
+    /// <summary>
+    /// FORK PATCH (P2): re-points the rig at a replacement hierarchy by resolving every cached
+    /// chain transform through <paramref name="resolveByName"/> using its ORIGINAL name, which
+    /// stays valid after RemapBones/name-based rebinding of a swapped body part.
+    /// <para>
+    /// <paramref name="newRoot"/> must be the replacement for THIS rig's root bone (normally
+    /// obtained by resolving the rig's own root name through <paramref name="resolveByName"/>),
+    /// NOT a hierarchy root such as the whole skeleton. The name of the supplied root is checked
+    /// against the rig's current root name and a mismatch fails the rebind with a clear reason, so
+    /// a wrong wiring can never silently commit.
+    /// </para>
+    /// <para>
+    /// All-or-nothing and side-effect-free on failure: every name is resolved (and the new
+    /// hierarchy validated) before any field is touched. On failure the rig is untouched.
+    /// On success the root, normalized-distance cache, and rest-pose cache are rebuilt from the
+    /// new hierarchy, and the transform lookup is regenerated for the new transform set.
+    /// </para>
+    /// </summary>
+    /// <param name="newRoot">Replacement for this rig's root bone (not a hierarchy/skeleton root).</param>
+    /// <param name="resolveByName">Name → Transform resolver (null return = unresolvable).</param>
+    /// <param name="failReason">Why the rebind failed, when false is returned.</param>
+    public bool TryRebind(Transform newRoot, Func<string, Transform> resolveByName, out string failReason) {
+        if (newRoot == null) {
+            failReason = "newRoot is null";
+            return false;
+        }
+        if (resolveByName == null) {
+            failReason = "resolveByName is null";
+            return false;
+        }
+
+        // FORK PATCH (P2): guard against a newRoot that belongs to a different rig (e.g. the
+        // hierarchy root being passed for every rig). Accept any non-null root only when the rig
+        // has no cached chain and no existing root to compare against (fresh/uninitialized data).
+        if (!IsValidNewRoot(newRoot)) {
+            var expectedName = GetCachedRootName();
+            failReason = $"newRoot '{newRoot.name}' does not match rig root '{expectedName}'";
+            return false;
+        }
+
+        var oldCachedData = transformCachedData;
+        if (oldCachedData is not { Length: > 0 }) {
+            // No cached chain to follow (fresh/invalid data) — rebuild straight from the new root.
+            rootBone = newRoot;
+            BuildNormalizedDistanceFromRootList();
+            failReason = null;
+            return true;
+        }
+
+        // Phase 1 — RESOLVE: validate that the entire chain maps into the new hierarchy by name.
+        // No mutations happen in this phase, so an unresolvable name leaves the rig untouched.
+        var resolved = new Transform[oldCachedData.Length];
+        for (int i = 0; i < oldCachedData.Length; i++) {
+            var bone = oldCachedData[i].bone;
+            if (bone == null) {
+                failReason = $"cached chain transform at index {i} is null";
+                return false;
+            }
+            var match = resolveByName(bone.name);
+            if (match == null) {
+                failReason = $"could not resolve bone '{bone.name}' in the new hierarchy";
+                return false;
+            }
+            resolved[i] = match;
+        }
+
+        // Sanity-check the resolved hierarchy before committing: two different source bones must
+        // not collapse onto the same transform (a resolver that returns the wrong node would
+        // otherwise build a corrupt tree).
+        for (int i = 0; i < resolved.Length; i++) {
+            for (int j = i + 1; j < resolved.Length; j++) {
+                if (resolved[i] == resolved[j]) {
+                    failReason = $"bones '{oldCachedData[i].bone.name}' and '{oldCachedData[j].bone.name}' both resolved to '{resolved[i].name}'";
+                    return false;
+                }
+            }
+        }
+
+        // Phase 2 — BUILD: regenerate the full cache from the new hierarchy on a LOCAL copy so a
+        // failed coverage check below still leaves the rig completely untouched.
+        var candidate = this;
+        candidate.rootBone = newRoot;
+        candidate.BuildNormalizedDistanceFromRootList();
+        var newCachedData = candidate.transformCachedData;
+
+        // Phase 3 — VERIFY: every resolved chain bone must be represented in the rebuilt cache.
+        // If the new hierarchy is missing a bone (or excludes it), fail rather than silently
+        // simulating a shorter/inconsistent chain.
+        var rebuiltBones = new HashSet<Transform>();
+        for (int j = 0; j < newCachedData.Length; j++) {
+            rebuiltBones.Add(newCachedData[j].bone);
+        }
+        for (int i = 0; i < resolved.Length; i++) {
+            if (!rebuiltBones.Contains(resolved[i])) {
+                failReason = $"bone '{oldCachedData[i].bone.name}' resolved to '{resolved[i].name}' but is missing from the rebuilt chain (excluded or not a descendant of the new root)";
+                return false;
+            }
+        }
+
+        // Phase 4 — COMMIT: apply the new hierarchy and rebuild rest/normalized caches.
+        // ResampleRestPose() also regenerates the lookup map for the new transform set.
+        transformCachedData = newCachedData;
+        transformToCachedDataMap = candidate.transformToCachedDataMap;
+        rootBone = newRoot;
+        ResampleRestPose();
+        failReason = null;
+        return true;
+    }
+
+    /// <summary>
     /// Sends updated parameters to the jiggle tree on the jobs side. Uses the provided list to prevent allocations.
     /// </summary>
     /// <param name="tree">Tree to update</param>

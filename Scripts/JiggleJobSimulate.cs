@@ -635,21 +635,31 @@ public struct JiggleJobSimulate : IJobFor {
         }
     }
 
-    private bool Validate(JiggleTreeJobData tree) {
-        if (!tree.GetIsValid(out string failReason)) {
-            throw new InvalidOperationException(failReason);
+    // FORK PATCH (P3b): previously threw on the first invalid frame, freezing the whole
+    // simulation forever (Validate ran BEFORE Sanitize, and the throw aborted the job). Now the
+    // offending tree is sanitized in place and simulation continues; a one-shot report keeps the
+    // console from being flooded by a persistently corrupt tree.
+    private bool ValidateAndSanitize(ref JiggleTreeJobData tree, int index) {
+        if (tree.ValidateAndSanitize()) {
+            return true;
         }
-
-        return true;
+        // Still structurally corrupt after repair: do NOT simulate it this tick (indexing garbage
+        // parent/child links would corrupt more state), but keep going so one bad tree cannot stop
+        // every other tree. The report is throttled to once per second window per tree slice.
+        if (tree.TryReportSanitize((int)timeStamp)) {
+            Debug.LogWarning(
+                $"JigglePhysics: tree {index} (rootID {tree.rootID}) failed validation after sanitize and is being skipped this tick. points={tree.pointCount}");
+        }
+        return false;
     }
 
     public void Execute(int index) {
         var tree = jiggleTrees[index];
-        #if UNITY_EDITOR
-        if (!Validate(tree)) {
+        if (!ValidateAndSanitize(ref tree, index)) {
+            // Persist the updated report throttle even when the tree cannot be simulated.
+            jiggleTrees[index] = tree;
             return;
         }
-        #endif
         Cache(ref tree);
         VerletIntegrate(tree);
         Constrain(tree);

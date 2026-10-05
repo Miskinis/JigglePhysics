@@ -31,7 +31,7 @@ public unsafe struct JiggleSimulatedPoint {
         return !float.IsNaN(value);
     }
 
-    public bool GetIsValid(int pointCount, out string failReason) {
+    public bool GetIsValid(int pointCount, int pointIndex, out string failReason) {
         if (!GetIsValid(lastPosition)) {
             failReason = "lastPosition is NaN";
             return false;
@@ -72,6 +72,10 @@ public unsafe struct JiggleSimulatedPoint {
             failReason = "parentIndex is outside range";
             return false;
         }
+        if (parentIndex == pointIndex) {
+            failReason = "parentIndex references itself";
+            return false;
+        }
         for (int i = 0; i < childrenCount; i++) {
             int childIndex = childrenIndices[i];
             if (childIndex < 0 || childIndex >= pointCount) {
@@ -91,7 +95,7 @@ public unsafe struct JiggleSimulatedPoint {
                $"children: [{childrenIndices[0]}, ...],\n childrenCount: {childrenCount},\n hasTransform: {hasTransform})";
     }
 
-    public void Sanitize() {
+    public void Sanitize(int pointCount, int pointIndex) {
         if (!GetIsValid(lastPosition)) {
             lastPosition = float3.zero;
         }
@@ -115,6 +119,20 @@ public unsafe struct JiggleSimulatedPoint {
         }
         if (!GetIsValid(distanceFromRoot)) {
             distanceFromRoot = 0.1f;
+        }
+        // (P3b) Structural repair so a corrupt tree can self-heal instead of being skipped
+        // forever: clamp child counts/indices and drop invalid parent links.
+        if (childrenCount < 0 || childrenCount > MAX_CHILDREN) {
+            childrenCount = 0;
+        }
+        for (int i = 0; i < childrenCount; i++) {
+            int childIndex = childrenIndices[i];
+            if (childIndex < 0 || childIndex >= pointCount) {
+                childrenIndices[i] = 0;
+            }
+        }
+        if (parentIndex < -1 || parentIndex >= pointCount || parentIndex == pointIndex) {
+            parentIndex = -1;
         }
     }
 }
